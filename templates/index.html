@@ -160,6 +160,44 @@
             box-shadow: 0 0 0 4px var(--focus);
         }
 
+        .api-key-wrap {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 8px;
+            margin-top: 8px;
+        }
+
+        .api-key-input {
+            border: 1px solid var(--border);
+            background: var(--glass-strong);
+            color: var(--text);
+            border-radius: 12px;
+            padding: 10px 10px;
+            font-weight: 600;
+            outline: none;
+        }
+
+        .api-key-input:focus {
+            box-shadow: 0 0 0 4px var(--focus);
+        }
+
+        .mini-btn {
+            border: 1px solid var(--border);
+            background: linear-gradient(135deg, var(--accent) 0%, var(--accent2) 100%);
+            color: white;
+            border-radius: 12px;
+            padding: 10px 12px;
+            cursor: pointer;
+            font-weight: 800;
+        }
+
+        .api-note {
+            margin-top: 6px;
+            color: var(--muted2);
+            font-size: 0.82em;
+            line-height: 1.3;
+        }
+
         .nav {
             margin-top: 16px;
             display: grid;
@@ -709,6 +747,11 @@
                         <option value="EUR">EUR (€)</option>
                         <option value="GBP">GBP (£)</option>
                     </select>
+                    <div class="api-key-wrap">
+                        <input id="tdApiKey" class="api-key-input" type="password" placeholder="Twelve Data API key (optional)" />
+                        <button type="button" class="mini-btn" onclick="saveApiKey()">Save</button>
+                    </div>
+                    <div class="api-note">If market data is blocked, add a free Twelve Data key here.</div>
                 </div>
             <nav class="nav">
                 <a href="#dashboard">Dashboard</a>
@@ -746,6 +789,7 @@
                 </div>
                 <div class="loading" id="loading">Loading stock data...</div>
                 <div class="error" id="error"></div>
+                <div class="loading" id="dataNote" style="display:none;"></div>
             </div>
 
             <div class="results-section" id="results">
@@ -911,11 +955,13 @@
         async function fetchAndRenderStock(symbol) {
             const loading = document.getElementById('loading');
             const error = document.getElementById('error');
+            const dataNote = document.getElementById('dataNote');
             const results = document.getElementById('results');
             const searchBtn = document.getElementById('searchBtn');
             
             // Reset UI
             error.style.display = 'none';
+            if (dataNote) dataNote.style.display = 'none';
             results.style.display = 'none';
             loading.style.display = 'block';
             searchBtn.disabled = true;
@@ -958,6 +1004,15 @@
                 
                 // Display results
                 displayResults(data);
+                if (dataNote) {
+                    const note = (data.data_note || '').toString().trim();
+                    if (note.length > 0) {
+                        dataNote.textContent = note;
+                        dataNote.style.display = 'block';
+                    } else {
+                        dataNote.style.display = 'none';
+                    }
+                }
                 loading.style.display = 'none';
                 results.style.display = 'block';
                 
@@ -991,6 +1046,32 @@
             return { ok: response.ok, status: response.status, data };
         }
 
+        async function saveApiKey() {
+            const input = document.getElementById('tdApiKey');
+            const key = (input && input.value ? input.value : '').trim();
+            const error = document.getElementById('error');
+            try {
+                const { ok, data } = await safeJsonFetch('/config/twelvedata', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_key: key })
+                });
+                if (!ok) throw new Error(data.error || 'Failed to save API key');
+                if (error) {
+                    error.textContent = key ? 'API key saved. Try searching again.' : 'API key cleared.';
+                    error.style.display = 'block';
+                }
+                if (lastSymbolSearched) {
+                    fetchAndRenderStock(lastSymbolSearched);
+                }
+            } catch (err) {
+                if (error) {
+                    error.textContent = err.message;
+                    error.style.display = 'block';
+                }
+            }
+        }
+
         async function addToPortfolio(event) {
             if (event && typeof event.preventDefault === 'function') event.preventDefault();
 
@@ -1011,7 +1092,7 @@
                 const { ok, data } = await safeJsonFetch('/portfolio/add', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ symbol, buy_price: buyPrice, shares })
+                    body: JSON.stringify({ symbol, buy_price: buyPrice, shares, currency: selectedCurrency })
                 });
                 if (!ok) throw new Error(data.error || 'Failed to add to portfolio');
 

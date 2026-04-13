@@ -5,11 +5,26 @@ from typing import Optional
 import time
 import json
 import urllib.request
+import urllib.parse
+import pandas as pd
+from io import StringIO
+import os
+import random
 from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
+@app.route("/")
+def home():
+    return render_template("index.html")
 
-API_PATHS = {'/get_stock_data', '/portfolio/add', '/portfolio/list', '/portfolio/remove'}
+
+API_PATHS = {
+    '/get_stock_data',
+    '/portfolio/add',
+    '/portfolio/list',
+    '/portfolio/remove',
+    '/config/twelvedata',
+}
 
 # Simple in-memory portfolio store (resets when server restarts).
 # Structure: { "AAPL": {"buy_price": 150.0, "shares": 2.0} }
@@ -23,6 +38,7 @@ FX_CACHE = {
     'rates': {'USD': 1.0},
 }
 FX_TTL_SECONDS = 30 * 60
+TWELVEDATA_API_KEY_RUNTIME = ""
 
 
 def normalize_currency(value: Optional[str]) -> str:
@@ -45,6 +61,176 @@ def fetch_usd_fx_rates() -> dict:
     if not isinstance(rates, dict) or "USD" not in rates:
         raise RuntimeError("FX API returned invalid rates")
     return rates
+
+
+def fetch_history_from_yahoo_chart(stock_symbol: str, range_value: str = "6mo", interval: str = "1d"):
+    """
+    Direct Yahoo chart API fallback (without yfinance wrapper state).
+    Returns DataFrame with Close column or empty DataFrame on failure.
+    """
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_symbol}"
+        f"?range={range_value}&interval={interval}&includePrePost=false&events=div%2Csplits"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        raw = resp.read().decode("utf-8")
+    payload = json.loads(raw)
+
+    chart = (payload.get("chart") or {})
+    err = chart.get("error")
+    if err:
+        raise RuntimeError(str(err))
+    results = chart.get("result") or []
+    if not results:
+        return pd.DataFrame()
+    first = results[0] or {}
+    timestamps = first.get("timestamp") or []
+    quote_list = (((first.get("indicators") or {}).get("quote")) or [])
+    if not quote_list:
+        return pd.DataFrame()
+    closes = (quote_list[0] or {}).get("close") or []
+    if not timestamps or not closes:
+        return pd.DataFrame()
+
+    rows = []
+    for ts, close in zip(timestamps, closes):
+        if close is None:
+            continue
+        try:
+            dt = datetime.utcfromtimestamp(int(ts))
+            rows.append((dt, float(close)))
+        except Exception:
+            continue
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows, columns=["Date", "Close"]).set_index("Date")
+    return df
+
+
+def fetch_history_from_stooq(stock_symbol: str):
+    """
+    Stooq CSV fallback (no API key).
+    For US stocks, Stooq commonly uses .US suffix.
+    Returns DataFrame with Date index and Close column.
+    """
+    candidates = [stock_symbol.lower(), f"{stock_symbol.lower()}.us"]
+    for sym in candidates:
+        url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "text/csv"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            csv_raw = resp.read().decode("utf-8", errors="ignore")
+        if not csv_raw or "No data" in csv_raw:
+            continue
+        try:
+            df = pd.read_csv(StringIO(csv_raw))
+        except Exception:
+            continue
+        if df is None or df.empty or "Date" not in df.columns or "Close" not in df.columns:
+            continue
+
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+        df = df.dropna(subset=["Date", "Close"]).set_index("Date").sort_index()
+        if not df.empty:
+            return df
+    return pd.DataFrame()
+
+
+def fetch_history_from_twelvedata(stock_symbol: str):
+    """
+    Optional fallback using Twelve Data (requires API key in env var).
+    Env: TWELVEDATA_API_KEY
+    """
+    api_key = (TWELVEDATA_API_KEY_RUNTIME or os.getenv("TWELVEDATA_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("TWELVEDATA_API_KEY not configured")
+
+    query = urllib.parse.urlencode({
+        "symbol": stock_symbol,
+        "interval": "1day",
+        "outputsize": 180,
+        "apikey": api_key,
+    })
+    url = f"https://api.twelvedata.com/time_series?{query}"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        raw = resp.read().decode("utf-8")
+    payload = json.loads(raw)
+
+    if payload.get("status") == "error":
+        raise RuntimeError(payload.get("message") or "Twelve Data API error")
+
+    values = payload.get("values") or []
+    if not values:
+        return pd.DataFrame()
+
+    rows = []
+    for row in values:
+        dt_raw = row.get("datetime")
+        close_raw = row.get("close")
+        if dt_raw is None or close_raw is None:
+            continue
+        try:
+            dt = datetime.fromisoformat(str(dt_raw))
+            close = float(close_raw)
+            rows.append((dt, close))
+        except Exception:
+            continue
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows, columns=["Date", "Close"]).set_index("Date").sort_index()
+    return df
+
+
+def generate_demo_history(stock_symbol: str, days: int = 126) -> pd.DataFrame:
+    """
+    Generate deterministic synthetic daily close prices so the UI remains usable
+    when all external providers are blocked by network policy.
+    """
+    seed = sum(ord(ch) for ch in stock_symbol.upper()) % 100000
+    rng = random.Random(seed)
+
+    base_price = 80 + (seed % 220)  # 80..299
+    drift = rng.uniform(-0.0007, 0.0012)
+    vol = rng.uniform(0.008, 0.02)
+
+    dates = pd.bdate_range(end=datetime.now(), periods=days)
+    price = float(base_price)
+    closes = []
+    for i in range(days):
+        cyc = 0.002 * (1 if (i // 14) % 2 == 0 else -1)
+        shock = rng.gauss(0, vol)
+        price = max(2.0, price * (1.0 + drift + cyc + shock))
+        closes.append(price)
+
+    return pd.DataFrame({"Close": closes}, index=dates)
+
+
+@app.route('/config/twelvedata', methods=['POST'])
+def config_twelvedata():
+    global TWELVEDATA_API_KEY_RUNTIME
+    payload = request.get_json(silent=True) or {}
+    key = str(payload.get('api_key', '')).strip()
+    # Allow clearing key by sending empty string.
+    TWELVEDATA_API_KEY_RUNTIME = key
+    return jsonify({'ok': True, 'configured': bool(TWELVEDATA_API_KEY_RUNTIME)})
 
 
 def get_usd_fx_rates() -> dict:
@@ -191,10 +377,6 @@ def analyze_stock(stock_symbol: str, include_chart: bool = True, target_currency
     Fetch and analyze stock for last ~6 months.
     Returns a JSON-ready dict. On failure returns {'error': ..., 'status_code': ...}.
     """
-    # Fetch stock data for last 6 months
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=180)  # ~6 months
-
     ticker = yf.Ticker(stock_symbol)
     stock_info = {}
     try:
@@ -204,15 +386,111 @@ def analyze_stock(stock_symbol: str, include_chart: bool = True, target_currency
     native_currency = normalize_currency(stock_info.get('currency') or 'USD')
     target_currency = normalize_currency(target_currency)
 
-    hist = ticker.history(start=start_date, end=end_date)
+    # Use period-based history instead of absolute dates to avoid
+    # system clock/date edge-cases returning empty data.
+    # yfinance can sometimes throw provider/network related exceptions;
+    # guard with fallbacks to avoid bubbling cryptic internal errors.
+    hist = None
+    history_errors = []
+    attempted_sources = []
+    td_configured = bool((TWELVEDATA_API_KEY_RUNTIME or os.getenv("TWELVEDATA_API_KEY") or "").strip())
+    td_error = ""
+    using_demo_data = False
+    try:
+        hist = ticker.history(period="1y", interval="1d", auto_adjust=False)
+    except Exception as e:
+        history_errors.append(f"yfinance_history_1y: {e}")
+
     if hist is None or hist.empty:
-        return {'error': f'No data found for symbol: {stock_symbol}', 'status_code': 404}
+        try:
+            attempted_sources.append("yfinance_history_6mo")
+            hist = ticker.history(period="6mo", interval="1d", auto_adjust=False)
+        except Exception as e:
+            history_errors.append(f"yfinance_history_6mo: {e}")
+
+    if hist is None or hist.empty:
+        # Fallback path: yfinance download API
+        try:
+            attempted_sources.append("yfinance_download_6mo")
+            fallback = yf.download(
+                tickers=stock_symbol,
+                period="6mo",
+                interval="1d",
+                progress=False,
+                auto_adjust=False,
+                group_by="column",
+            )
+            if isinstance(fallback, pd.DataFrame) and not fallback.empty:
+                hist = fallback
+        except Exception as e:
+            history_errors.append(f"yfinance_download_6mo: {e}")
+
+    if hist is None or hist.empty:
+        # Fallback path: direct Yahoo chart API call
+        try:
+            attempted_sources.append("yahoo_chart_api_6mo")
+            direct_hist = fetch_history_from_yahoo_chart(stock_symbol, range_value="6mo", interval="1d")
+            if isinstance(direct_hist, pd.DataFrame) and not direct_hist.empty:
+                hist = direct_hist
+        except Exception as e:
+            history_errors.append(f"yahoo_chart_api_6mo: {e}")
+
+    if hist is None or hist.empty:
+        # Fallback path: Stooq (free CSV endpoint)
+        try:
+            attempted_sources.append("stooq_csv")
+            stooq_hist = fetch_history_from_stooq(stock_symbol)
+            if isinstance(stooq_hist, pd.DataFrame) and not stooq_hist.empty:
+                hist = stooq_hist
+        except Exception as e:
+            history_errors.append(f"stooq_csv: {e}")
+
+    if hist is None or hist.empty:
+        # Fallback path: Twelve Data (optional API key)
+        try:
+            attempted_sources.append("twelvedata_time_series")
+            td_hist = fetch_history_from_twelvedata(stock_symbol)
+            if isinstance(td_hist, pd.DataFrame) and not td_hist.empty:
+                hist = td_hist
+        except Exception as e:
+            td_error = str(e)
+            history_errors.append(f"twelvedata_time_series: {e}")
+
+    if hist is None or hist.empty:
+        error_hint = (
+            "Unable to fetch data from available providers right now. "
+            "Please try again in a minute."
+        )
+        if td_configured and td_error:
+            error_hint = f"Twelve Data key appears invalid or blocked: {td_error}"
+        if history_errors:
+            combined = " | ".join(history_errors).lower()
+            if "connect tunnel failed" in combined or "403" in combined:
+                # Auto-fallback to synthetic data so the app remains usable offline/restricted.
+                hist = generate_demo_history(stock_symbol, days=126)
+                using_demo_data = True
+            else:
+                error_hint = (
+                    "Network/provider blocked requests (HTTP 403) for market data endpoints. "
+                    "Try another network/VPN or configure TWELVEDATA_API_KEY for a reliable fallback."
+                )
+
+        if hist is None or hist.empty:
+            return {
+                'error': f'No data found for symbol: {stock_symbol}. {error_hint}',
+                'status_code': 404,
+                'attempted_sources': attempted_sources,
+            }
 
     closes = hist.get('Close')
     if closes is None or closes.dropna().empty:
         return {'error': f'No price data found for symbol: {stock_symbol}', 'status_code': 404}
 
     closes = closes.dropna()
+    # Focus on roughly the last 6 months of trading sessions.
+    closes = closes.tail(126)
+    if closes.empty:
+        return {'error': f'No recent price data found for symbol: {stock_symbol}', 'status_code': 404}
 
     start_price = float(closes.iloc[0])
     end_price = float(closes.iloc[-1])
@@ -274,6 +552,8 @@ def analyze_stock(stock_symbol: str, include_chart: bool = True, target_currency
         'native_currency': native_currency,
         'currency': target_currency,
         'currency_symbol': CURRENCY_SYMBOLS.get(target_currency, '$'),
+        'data_source': 'demo' if using_demo_data else 'live',
+        'data_note': 'Using simulated demo market data due to provider/network restrictions.' if using_demo_data else '',
         'current_price': round(current_price_conv, 2),
         'start_price': round(start_price_conv, 2),
         'end_price': round(end_price_conv, 2),
