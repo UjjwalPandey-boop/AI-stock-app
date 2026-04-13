@@ -783,4 +783,5 @@ def generate_signal(growth_percentage: float, volatility_percentage: float, tren
     return "HOLD", reasons + ["Signal: HOLD (mixed signals or insufficient edge)."]
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
